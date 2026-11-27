@@ -71,6 +71,11 @@ db.exec(`
   );
 `);
 
+// Міграції для баз, створених раніше: нові колонки додаємо, якщо їх ще немає.
+const shopCols = db.prepare('PRAGMA table_info(shops)').all().map((c) => c.name);
+if (!shopCols.includes('bot_token')) db.exec('ALTER TABLE shops ADD COLUMN bot_token TEXT');
+if (!shopCols.includes('bot_username')) db.exec('ALTER TABLE shops ADD COLUMN bot_username TEXT');
+
 const json = (s, fallback) => {
   try {
     return JSON.parse(s);
@@ -113,6 +118,13 @@ export function updateShop(id, field, value) {
   if (!SHOP_FIELDS.includes(field)) throw new Error('bad field');
   db.prepare(`UPDATE shops SET ${field} = ? WHERE id = ?`).run(value, id);
 }
+
+/** Власний бот магазину: token — зашифрований, username — для посилань. null — відключити. */
+export function setShopBot(shopId, encryptedToken, username) {
+  db.prepare('UPDATE shops SET bot_token = ?, bot_username = ? WHERE id = ?').run(encryptedToken, username, shopId);
+}
+export const shopsWithBots = () => db.prepare('SELECT * FROM shops WHERE bot_token IS NOT NULL').all();
+export const shopByBotUsername = (u) => db.prepare('SELECT * FROM shops WHERE bot_username = ?').get(u);
 
 // ───── Товари ─────
 

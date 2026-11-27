@@ -6,8 +6,9 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { config } from './config.mjs';
 
-export async function tg(method, body) {
-  const res = await fetch(`${config.telegramApi}/bot${config.botToken}/${method}`, {
+/** Виклик Bot API. token — токен бота (за замовчуванням — бот платформи). */
+export async function tg(method, body, token = config.botToken) {
+  const res = await fetch(`${config.telegramApi}/bot${token}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body ?? {}),
@@ -39,8 +40,8 @@ export async function downloadPhoto(fileId) {
  * https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
  * Повертає користувача Telegram або null, якщо підпис невірний чи дані застарілі.
  */
-export function verifyInitData(initData, maxAgeSec = 24 * 3600) {
-  if (!initData || !config.botToken) return null;
+export function verifyInitData(initData, token = config.botToken, maxAgeSec = 24 * 3600) {
+  if (!initData || !token) return null;
   const params = new URLSearchParams(initData);
   const hash = params.get('hash');
   if (!hash) return null;
@@ -49,7 +50,7 @@ export function verifyInitData(initData, maxAgeSec = 24 * 3600) {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([k, v]) => `${k}=${v}`)
     .join('\n');
-  const secret = createHmac('sha256', 'WebAppData').update(config.botToken).digest();
+  const secret = createHmac('sha256', 'WebAppData').update(token).digest();
   const calc = createHmac('sha256', secret).update(check).digest();
   const given = Buffer.from(hash, 'hex');
   if (given.length !== calc.length || !timingSafeEqual(given, calc)) return null;
@@ -61,6 +62,9 @@ export function verifyInitData(initData, maxAgeSec = 24 * 3600) {
     return null;
   }
 }
+
+/** Схоже на токен бота з @BotFather: 123456789:AA… */
+export const TOKEN_RE = /^\d{6,12}:[A-Za-z0-9_-]{30,50}$/;
 
 export const escapeHtml = (s) =>
   String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);

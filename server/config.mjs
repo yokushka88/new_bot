@@ -27,3 +27,6 @@ export const config = {
 };
 
 export const isAdmin = (id) => config.adminIds.includes(Number(id));
+
+/** Адреса сторінки магазину (Mini App і PWA). Порожньо, поки немає публічного домену. */
+export const shopUrl = (shop) => (config.publicUrl ? `${config.publicUrl}/s/${shop.slug}` : '');

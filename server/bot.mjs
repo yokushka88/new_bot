@@ -4,18 +4,22 @@
 //  • адміністратору платформи — створення магазинів і запрошення власників.
 // Працює через long polling, стан діалогу зберігається в базі.
 
-import { config, isAdmin } from './config.mjs';
+import { config, isAdmin, shopUrl } from './config.mjs';
 import {
   SLUG_RE, addProduct, allShops, claimShop, countOrders, createShop, deleteProduct, getProduct, getSession,
-  getShop, getShopBySlug, listProducts, newInvite, setSession, shopsOfOwner, toggleSize, updateProduct, updateShop,
+  getShop, getShopBySlug, listProducts, newInvite, setSession, setShopBot, shopsOfOwner, shopsWithBots, toggleSize, updateProduct,
+  updateShop,
 } from './db.mjs';
 import { CATEGORIES, categoryName } from './catalog.mjs';
 import { parsePost, splitList } from './parse.mjs';
-import { downloadPhoto, escapeHtml as h, tg } from './telegram.mjs';
+import { downloadPhoto, escapeHtml as h, TOKEN_RE, tg } from './telegram.mjs';
+import { encrypt } from './secret.mjs';
+import { shopBotToken, startAllShopBots, startShopBot, stopShopBot } from './shopBots.mjs';
 
 let botUsername = '';
-const shopUrl = (shop) => (config.publicUrl ? `${config.publicUrl}/s/${shop.slug}` : '');
 const botLink = (payload) => `https://t.me/${botUsername}?start=${payload}`;
+/** Посилання для покупців: власний бот магазину, якщо підключено, інакше бот платформи. */
+const buyerLink = (shop) => (shop.bot_username ? `https://t.me/${shop.bot_username}` : botLink(`s_${shop.slug}`));
 const money = (n) => `${new Intl.NumberFormat('uk-UA').format(n)} ₴`;
 
 // ───── Клавіатури ─────
@@ -286,12 +290,13 @@ const SETTINGS = {
 
 async function settingsView(chatId, shop) {
   const rows = Object.entries(SETTINGS).map(([k, [label]]) => [{ text: label, callback_data: `set:${k}` }]);
+  rows.push([{ text: shop.bot_username ? `🤖 Свій бот: @${shop.bot_username}` : '🤖 Підключити свій бот', callback_data: 'bot:menu' }]);
   const v = (x) => (x ? h(x) : '—');
   await say(
     chatId,
     `<b>Налаштування «${h(shop.name)}»</b>\n\n` +
       `Менеджер: ${v(shop.manager)}\nДоставка: ${v(shop.delivery_note)}\nВідгуки: ${v(shop.reviews_url)}\n` +
-      `Банер: ${v(shop.hero_title)} / ${v(shop.hero_text)}`,
+      `Банер: ${v(shop.hero_title)} / ${v(shop.hero_text)}\nСвій бот: ${shop.bot_username ? '@' + h(shop.bot_username) : '—'}`,
     { reply_markup: inline(rows) },
   );
 }
@@ -313,6 +318,84 @@ async function applySetting(chatId, userId, s, text) {
   return settingsView(chatId, getShop(shop.id));
 }
 
+// ───── Власний бот магазину ─────
+
+async function botMenu(chatId, userId, s, action) {
+  const shop = currentShop(userId, s);
+  if (!canManage(userId, shop)) return;
+  if (action === 'menu') {
+    if (shop.bot_username)
+      return say(
+        chatId,
+        `🤖 Покупці заходять у магазин через <b>@${h(shop.bot_username)}</b>.\n\n` +
+          'Керування товарами й замовлення лишаються тут. Відключити бота можна будь-коли — або тут, або відкликавши токен у @BotFather.',
+        { reply_markup: inline([[{ text: 'Відключити свій бот', callback_data: 'bot:off' }]]) },
+      );
+    return say(
+      chatId,
+      '🤖 <b>Свій бот для магазину</b>\n\n' +
+        'Покупці бачитимуть ваш бот — з вашою назвою й аватаркою.\n\n' +
+        '1. Відкрийте @BotFather і надішліть /newbot\n' +
+        '2. Придумайте назву й username (має закінчуватися на «bot»)\n' +
+        '3. Скопіюйте токен, який надішле @BotFather, і надішліть його сюди.\n\n' +
+        'Повідомлення з токеном я одразу видалю з чату, а сам токен зберігається на сервері в зашифрованому вигляді.',
+      { reply_markup: inline([[{ text: 'Надіслати токен', callback_data: 'bot:set' }]]) },
+    );
+  }
+  if (action === 'set') {
+    setSession(userId, { shopId: shop.id, botTokenFor: shop.id });
+    return say(chatId, 'Надішліть токен бота з @BotFather (виглядає як <code>123456789:AA…</code>):', { reply_markup: CANCEL_KB });
+  }
+  if (action === 'off')
+    return say(chatId, `Відключити @${h(shop.bot_username || '')}? Покупці знову заходитимуть через бот платформи.`, {
+      reply_markup: inline([[{ text: 'Так, відключити', callback_data: 'bot:offy' }, { text: 'Ні', callback_data: 'bot:menu' }]]),
+    });
+  if (action === 'offy') {
+    const token = shopBotToken(shop);
+    stopShopBot(shop.id);
+    if (token) await tg('setChatMenuButton', { menu_button: { type: 'default' } }, token).catch(() => {});
+    setShopBot(shop.id, null, null);
+    return say(chatId, '✅ Свій бот відключено. Посилання для покупців тепер через бот платформи: «🔗 Посилання».', { reply_markup: OWNER_KB });
+  }
+}
+
+async function connectShopBot(chatId, userId, s, msg) {
+  const shop = getShop(s.botTokenFor);
+  if (!canManage(userId, shop)) return;
+  const token = (msg.text || '').trim();
+  // Повідомлення з токеном одразу прибираємо з чату
+  await tg('deleteMessage', { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
+  if (!TOKEN_RE.test(token)) return say(chatId, 'Це не схоже на токен. Скопіюйте його з @BotFather повністю й надішліть ще раз.');
+  if (token === config.botToken) return say(chatId, 'Це токен бота платформи. Потрібен токен вашого власного бота.');
+  if (shopsWithBots().some((x) => x.id !== shop.id && shopBotToken(x) === token))
+    return say(chatId, 'Цей бот уже підключено до іншого магазину. Створіть окремого бота.');
+  let me;
+  try {
+    me = await tg('getMe', {}, token);
+  } catch {
+    return say(chatId, 'Telegram не приймає цей токен. Перевірте, що скопіювали його повністю й не відкликали в @BotFather.');
+  }
+  setShopBot(shop.id, encrypt(token), me.username);
+  setSession(userId, { shopId: shop.id });
+  startShopBot(shop.id, onShopBotRevoked);
+  return say(
+    chatId,
+    `✅ Підключено <b>@${h(me.username)}</b>.\n\nТепер посилання для покупців: https://t.me/${me.username}\n` +
+      'Вставте його в канал або закріпіть. Замовлення й надалі приходитимуть сюди.',
+    { reply_markup: OWNER_KB },
+  );
+}
+
+/** Клієнт відкликав токен у @BotFather — повідомляємо власника. */
+function onShopBotRevoked(shop) {
+  if (!shop?.owner_id) return;
+  say(
+    shop.owner_id,
+    `⚠️ Бот магазину «${h(shop.name)}» перестав працювати: токен відкликано в @BotFather. Покупці знову заходять через бот платформи. ` +
+      'Щоб підключити бота знову: «⚙️ Налаштування» → «🤖 Підключити свій бот».',
+  ).catch(() => {});
+}
+
 // ───── Посилання й привітання ─────
 
 async function linksView(chatId, shop) {
@@ -320,7 +403,7 @@ async function linksView(chatId, shop) {
   await say(
     chatId,
     `<b>Посилання на «${h(shop.name)}»</b>\n\n` +
-      `🤖 Для покупців у Telegram (вставте в канал або закріпіть):\n${botLink(`s_${shop.slug}`)}\n\n` +
+      `🤖 Для покупців у Telegram (вставте в канал або закріпіть):\n${buyerLink(shop)}\n\n` +
       (web
         ? `🌐 Сайт, який можна встановити на телефон як застосунок:\n${web}\n\n` +
           'На Android браузер сам запропонує «Встановити». На iPhone: «Поділитися» → «На екран Додому».'
@@ -368,7 +451,7 @@ async function adminCommand(chatId, userId, text) {
     return say(
       chatId,
       shops
-        .map((s) => `${s.active ? '🟢' : '⏸'} <b>${h(s.name)}</b> (<code>${s.slug}</code>) — товарів ${listProducts(s.id).length}, замовлень ${countOrders(s.id)}, власник ${s.owner_id ? '✅' : '— запрошення не прийнято'}`)
+        .map((s) => `${s.active ? '🟢' : '⏸'} <b>${h(s.name)}</b> (<code>${s.slug}</code>) — товарів ${listProducts(s.id).length}, замовлень ${countOrders(s.id)}, власник ${s.owner_id ? '✅' : '— запрошення не прийнято'}${s.bot_username ? `, бот @${s.bot_username}` : ''}`)
         .join('\n'),
     );
   }
@@ -458,6 +541,7 @@ async function onMessage(msg) {
   if (s.step && s.step !== 'confirm' && s.draft && text) return wizardText(chatId, userId, s, text);
   if (s.edit && text) return applyEdit(chatId, userId, s, text);
   if (s.setting && text) return applySetting(chatId, userId, s, text);
+  if (s.botTokenFor && text) return connectShopBot(chatId, userId, s, msg);
 
   // Фото без майстра (напр., переслали пост) — одразу починаємо додавання товару
   if (msg.photo?.length) {
@@ -536,6 +620,8 @@ async function onCallback(q) {
   }
 
   // Налаштування
+  if (kind === 'bot') return botMenu(chatId, userId, s, a);
+
   if (kind === 'set' && SETTINGS[a]) {
     const shop = currentShop(userId, s);
     if (!canManage(userId, shop)) return;
@@ -589,7 +675,7 @@ async function onCallback(q) {
 
 // ───── Сповіщення про замовлення ─────
 
-export async function notifyOrder(shop, o) {
+export async function notifyOrder(shop, o, buyerToken = config.botToken) {
   if (!config.botToken) return;
   const lines = o.lines.map((l) => `• ${h(l.name)}${l.variant ? ` (${h(l.variant)})` : ''} × ${l.qty} — ${money(l.price * l.qty)}`);
   const buyer = o.buyer
@@ -603,10 +689,17 @@ export async function notifyOrder(shop, o) {
   const targets = shop.owner_id ? [shop.owner_id] : config.adminIds;
   for (const id of targets) await say(id, text).catch((e) => console.error('Сповіщення власнику:', e.message));
   if (o.buyer?.id) {
-    await say(
-      o.buyer.id,
-      `✅ Ваше замовлення №${o.number} у «${h(shop.name)}» прийнято на суму ${money(o.total)}.\n` +
-        (shop.manager ? `Менеджер ${h(shop.manager)} зв’яжеться з вами найближчим часом.` : 'Продавець зв’яжеться з вами найближчим часом.'),
+    // Підтвердження — від того бота, через який покупець відкрив магазин
+    await tg(
+      'sendMessage',
+      {
+        chat_id: o.buyer.id,
+        parse_mode: 'HTML',
+        text:
+          `✅ Ваше замовлення №${o.number} у «${h(shop.name)}» прийнято на суму ${money(o.total)}.\n` +
+          (shop.manager ? `Менеджер ${h(shop.manager)} зв’яжеться з вами найближчим часом.` : 'Продавець зв’яжеться з вами найближчим часом.'),
+      },
+      buyerToken,
     ).catch(() => {});
   }
 }
@@ -629,6 +722,7 @@ export function startBot() {
         botUsername = me.username;
         await tg('setMyCommands', { commands: [{ command: 'start', description: 'Головне меню' }] });
         console.log(`Бот: @${botUsername} запущено${config.publicUrl ? `, сайт ${config.publicUrl}` : ''}`);
+        startAllShopBots(onShopBotRevoked);
         break;
       } catch (e) {
         console.error('Бот: не вдалося запустити —', e.message);

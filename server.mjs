@@ -9,6 +9,7 @@ import { countOrders, getShopBySlug, saveOrder } from './server/db.mjs';
 import { publicCatalog, validateOrder } from './server/catalog.mjs';
 import { verifyInitData } from './server/telegram.mjs';
 import { notifyOrder, startBot } from './server/bot.mjs';
+import { shopBotToken } from './server/shopBots.mjs';
 
 const DIST = resolve(config.root, 'dist');
 const MEDIA = resolve(config.dataDir, 'media');
@@ -166,7 +167,10 @@ function rateLimited(ip) {
 }
 
 async function createOrder(req, res, shop) {
-  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  // Адресу покупця беремо з того, що додав проксі Railway (X-Real-IP або останній запис
+  // X-Forwarded-For): перші записи клієнт може підробити, щоб обійти обмеження.
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const ip = String(req.headers['x-real-ip'] || xff[xff.length - 1] || req.socket.remoteAddress || '');
   if (rateLimited(ip)) return sendJson(res, 429, { error: 'Забагато замовлень поспіль. Спробуйте за кілька хвилин.' });
   let body;
   try {
@@ -177,12 +181,20 @@ async function createOrder(req, res, shop) {
   const { order, error } = validateOrder(shop, body);
   if (error) return sendJson(res, 400, { error });
   // Покупця з Telegram довіряємо лише якщо підпис initData правильний.
-  const buyer = body.telegramInitData ? verifyInitData(String(body.telegramInitData)) : null;
-  if (body.telegramInitData && !buyer) return sendJson(res, 403, { error: 'Не вдалося перевірити дані Telegram. Відкрийте магазин заново.' });
+  // Магазин могли відкрити через бот платформи або через власний бот магазину — перевіряємо обидва підписи.
+  let buyer = null;
+  let buyerToken = config.botToken;
+  if (body.telegramInitData) {
+    const raw = String(body.telegramInitData);
+    buyer = verifyInitData(raw);
+    const own = shopBotToken(shop);
+    if (!buyer && own && (buyer = verifyInitData(raw, own))) buyerToken = own;
+    if (!buyer) return sendJson(res, 403, { error: 'Не вдалося перевірити дані Telegram. Відкрийте магазин заново.' });
+  }
   if (buyer) order.buyer = { id: buyer.id, username: buyer.username || '', name: [buyer.first_name, buyer.last_name].filter(Boolean).join(' ') };
   const id = saveOrder(shop.id, order, order.total);
   const number = countOrders(shop.id);
-  notifyOrder(shop, { ...order, number }).catch((e) => console.error('Замовлення: не вдалося сповістити —', e.message));
+  notifyOrder(shop, { ...order, number }, buyerToken).catch((e) => console.error('Замовлення: не вдалося сповістити —', e.message));
   sendJson(res, 200, { orderId: String(number), id });
 }
 

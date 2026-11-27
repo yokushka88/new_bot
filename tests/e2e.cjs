@@ -7,7 +7,7 @@ const ADMIN = 111, OWNER = 222, BUYER = 333;
 const results = [];
 const check = (n, ok, x = '') => { results.push(ok); console.log(`${ok ? '✔' : '✘'} ${n}${x ? ' — ' + x : ''}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const push = (u) => fetch(MOCK + '/__push', { method: 'POST', body: JSON.stringify(u) });
+const push = (u, token = 'TEST:TOKEN') => fetch(MOCK + '/__push?token=' + encodeURIComponent(token), { method: 'POST', body: JSON.stringify(u) });
 const calls = async () => (await fetch(MOCK + '/__calls')).json();
 async function waitCall(pred, ms = 6000) {
   const t = Date.now();
@@ -15,15 +15,16 @@ async function waitCall(pred, ms = 6000) {
   return null;
 }
 let mid = 1;
-const msg = (from, extra) => push({ message: { message_id: mid++, from: { id: from, first_name: 'U' + from }, chat: { id: from, type: 'private' }, date: 0, ...extra } });
+const msg = (from, extra, token) => push({ message: { message_id: mid++, from: { id: from, first_name: 'U' + from }, chat: { id: from, type: 'private' }, date: 0, ...extra } }, token);
 const text = (from, t) => msg(from, { text: t });
 const cb = (from, data) => push({ callback_query: { id: String(mid++), from: { id: from }, data, message: { message_id: 1, chat: { id: from, type: 'private' } } } });
-const textTo = (id, re) => waitCall((c) => (c.m === 'sendMessage' || c.m === 'sendPhoto') && c.body.chat_id === id && re.test(c.body.text || c.body.caption || ''));
+const textTo = (id, re, token = 'TEST:TOKEN') =>
+  waitCall((c) => c.token === token && (c.m === 'sendMessage' || c.m === 'sendPhoto') && c.body.chat_id === id && re.test(c.body.text || c.body.caption || ''));
 
-function initData(user) {
+function initData(user, token = 'TEST:TOKEN') {
   const p = new URLSearchParams({ auth_date: String(Math.floor(Date.now() / 1000)), query_id: 'q1', user: JSON.stringify(user) });
   const check = [...p.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join('\n');
-  const secret = crypto.createHmac('sha256', 'WebAppData').update('TEST:TOKEN').digest();
+  const secret = crypto.createHmac('sha256', 'WebAppData').update(token).digest();
   p.set('hash', crypto.createHmac('sha256', secret).update(check).digest('hex'));
   return p.toString();
 }
@@ -142,6 +143,42 @@ function initData(user) {
   const btn = await waitCall((c) => c.m === 'sendMessage' && c.body.chat_id === BUYER && c.body.reply_markup?.inline_keyboard?.[0]?.[0]?.web_app);
   check('Покупець отримує кнопку магазину', !!btn && btn.body.reply_markup.inline_keyboard[0][0].web_app.url.endsWith('/s/snake'));
 
+
+  // 9. Власний бот магазину
+  const OWN = '987654321:' + 'A'.repeat(35);
+  await text(OWNER, '⚙️ Налаштування');
+  await textTo(OWNER, /Налаштування/);
+  await cb(OWNER, 'bot:menu');
+  await textTo(OWNER, /Свій бот для магазину/);
+  await cb(OWNER, 'bot:set');
+  await textTo(OWNER, /Надішліть токен/);
+  await text(OWNER, '123:BAD' + 'x'.repeat(30));
+  check('Невірний токен відхилено', !!(await textTo(OWNER, /не схоже на токен|не приймає/)));
+  await text(OWNER, OWN);
+  const connected = await textTo(OWNER, /Підключено/);
+  check('Свій бот підключено', !!connected && /Shop987654321Bot/.test(connected.body.text));
+  check('Повідомлення з токеном видалено', !!(await waitCall((c) => c.m === 'deleteMessage' && c.body.chat_id === OWNER)));
+  check('Кнопка «Магазин» у боті клієнта', !!(await waitCall((c) => c.token === OWN && c.m === 'setChatMenuButton' && c.body.menu_button?.web_app?.url?.endsWith('/s/snake'))));
+  await msg(BUYER, { text: '/start' }, OWN);
+  const ownBtn = await waitCall((c) => c.token === OWN && c.m === 'sendMessage' && c.body.chat_id === BUYER && c.body.reply_markup?.inline_keyboard?.[0]?.[0]?.web_app);
+  check('Покупець відкриває магазин через бот клієнта', !!ownBtn);
+  await text(OWNER, '🔗 Посилання');
+  check('Посилання веде на бот клієнта', !!(await textTo(OWNER, /t\.me\/Shop987654321Bot/)));
+  const db = await (await fetch(APP + '/api/shops/snake')).json();
+  check('Токен не потрапляє в API магазину', !JSON.stringify(db).includes('987654321'));
+  // замовлення з initData, підписаним ботом клієнта
+  const cap = db.products.find((p) => p.name.includes('Шапка'));
+  await sleep(1000);
+  const viaOwn = await fetch(APP + '/api/shops/snake/orders', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': '10.0.0.9' },
+    body: JSON.stringify({ ...base, lines: [{ productId: cap.id, selection: { color: 'c0' }, qty: 1 }], telegramInitData: initData({ id: BUYER, first_name: 'B' }, OWN) }),
+  });
+  check('Замовлення з бота клієнта приймається', viaOwn.status === 200, String(viaOwn.status));
+  check('Підтвердження покупцю — від бота клієнта', !!(await textTo(BUYER, /прийнято/, OWN)));
+  // клієнт відкликає токен у @BotFather
+  await fetch(MOCK + '/__revoke?token=' + encodeURIComponent(OWN));
+  check('Відкликаний токен — власника попереджено', !!(await textTo(OWNER, /токен відкликано/, 'TEST:TOKEN')));
   const failed = results.filter((x) => !x).length;
   console.log(`\n${results.length - failed}/${results.length} перевірок пройдено`);
   process.exit(failed ? 1 : 0);
