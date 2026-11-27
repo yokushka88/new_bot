@@ -9,6 +9,17 @@
   й наявність, отримують замовлення в Telegram.
 - **Адміністратор платформи** (ви) створює магазини й надсилає власникам запрошення.
 
+## Встановлення на власний сервер (Hetzner тощо)
+
+Сервер Ubuntu 22.04/24.04 (напр. Hetzner CX22, ~€4/міс) і адреса, що вказує на його IP
+(напр. безкоштовна `myshops.duckdns.org`). У консолі сервера від root:
+```bash
+curl -fsSL https://raw.githubusercontent.com/yokushka88/new_bot/main/deploy/install.sh -o install.sh && bash install.sh
+```
+Скрипт запитає адресу, токен бота й ваш Telegram ID, а далі сам встановить Node.js 22, Caddy (HTTPS),
+автозапуск, фаєрвол і оновлення безпеки. Оновити платформу з GitHub: `shop-update`.
+Журнал: `journalctl -u shop -f`. База й фото: `/var/lib/shop` (увімкніть Backups у Hetzner).
+
 ## Налаштування Railway (один раз)
 
 1. **New Project → Deploy from GitHub repo** → цей репозиторій.
