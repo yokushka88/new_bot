@@ -30,4 +30,4 @@ dist-single
 !.env.example
 
 # Дані платформи (база й фото) — лише на сервері
-data/
+/data/
